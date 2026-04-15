@@ -416,9 +416,15 @@ def assemble_chunks_audio(audio_chunks: List[np.ndarray], sr: int) -> np.ndarray
 
 # ─── API Endpoints ───────────────────────────────────────────────────────────
 
+@app.get("/ping")
+async def ping():
+    """RunPod health check endpoint (required for Load Balancer)."""
+    return {"status": "ok"}
+
+
 @app.get("/health")
 async def health():
-    """Health check endpoint."""
+    """Detailed health check endpoint."""
     return {
         "status": "ok",
         "device": device,

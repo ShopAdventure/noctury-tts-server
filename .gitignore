@@ -36,6 +36,7 @@ env/
 outputs/
 resources/*.wav
 resources/*.mp3
+!resources/maxime.mp3
 !resources/.gitkeep
 
 # Environment

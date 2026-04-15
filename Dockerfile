@@ -96,8 +96,9 @@ RUN mkdir -p /app/server/outputs /app/server/resources
 COPY server.py /app/server/
 COPY start.sh /app/server/
 
-# Copy voice reference files if they exist
-COPY resources/ /app/server/resources/
+# Copy voice reference files (Maxime voice sample for cloning)
+COPY resources/maxime.mp3 /app/server/resources/maxime.mp3
+COPY resources/.gitkeep /app/server/resources/.gitkeep
 
 # Fix line endings and make executable
 RUN sed -i 's/\r$//' /app/server/start.sh \

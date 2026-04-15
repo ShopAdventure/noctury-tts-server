@@ -12,8 +12,12 @@ cd "$(dirname "$0")"
 # Add the current directory to PYTHONPATH
 export PYTHONPATH="$PYTHONPATH:$(pwd)"
 
+# Use RunPod PORT env var if available, otherwise default to 7860
+SERVER_PORT=${PORT:-7860}
+echo "Server port: $SERVER_PORT"
+
 # Start the FastAPI server with uvicorn in the background
-python3 -m uvicorn server:app --host 0.0.0.0 --port 7860 --workers 1 &
+python3 -m uvicorn server:app --host 0.0.0.0 --port $SERVER_PORT --workers 1 &
 
 # Keep container running for RunPod web terminal access
 sleep infinity
