@@ -43,8 +43,8 @@ print('  -> Whisper ready')
 
 echo "=== Models ready ==="
 
-# Use RunPod PORT env var if available, otherwise default to 7860
-SERVER_PORT=${PORT:-7860}
+# Use RunPod PORT env var if available, otherwise default to 8000
+SERVER_PORT=${PORT:-8000}
 echo "Server port: $SERVER_PORT"
 
 # Start the FastAPI server with uvicorn in the background
