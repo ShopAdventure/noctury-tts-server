@@ -12,6 +12,37 @@ cd "$(dirname "$0")"
 # Add the current directory to PYTHONPATH
 export PYTHONPATH="$PYTHONPATH:$(pwd)"
 
+# ─── Download models if not already cached ───────────────────────────────────
+echo "=== Checking/Downloading models ==="
+
+python3 -c "
+from huggingface_hub import snapshot_download
+import os
+
+models = [
+    'Qwen/Qwen3-TTS-12Hz-1.7B-Base',
+    'Qwen/Qwen3-TTS-Tokenizer-12Hz',
+]
+
+for model in models:
+    print(f'Checking model: {model}')
+    try:
+        path = snapshot_download(model)
+        print(f'  -> Ready at: {path}')
+    except Exception as e:
+        print(f'  -> Downloading: {model}')
+        path = snapshot_download(model)
+        print(f'  -> Downloaded to: {path}')
+
+# Download whisper base model
+print('Checking Whisper base model...')
+import whisper
+whisper.load_model('base')
+print('  -> Whisper ready')
+"
+
+echo "=== Models ready ==="
+
 # Use RunPod PORT env var if available, otherwise default to 7860
 SERVER_PORT=${PORT:-7860}
 echo "Server port: $SERVER_PORT"

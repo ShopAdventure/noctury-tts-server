@@ -1,29 +1,35 @@
 # =============================================================================
 # Noctury TTS Server — Qwen3-TTS Self-Hosted
-# Multi-stage Docker build optimized for RunPod Serverless
+# Lightweight Docker build — models are downloaded at first startup
+# Optimized for RunPod Serverless (smaller image = faster pull)
 # =============================================================================
 
-# Stage 1: Builder - Install dependencies and download models
-# =============================================================================
 ARG DOCKER_FROM=nvidia/cuda:12.8.0-runtime-ubuntu22.04
-FROM ${DOCKER_FROM} AS builder
+FROM ${DOCKER_FROM}
 
 ARG DEBIAN_FRONTEND=noninteractive
 
-# Install build dependencies
+LABEL maintainer="Noctury / ShopAdventure"
+LABEL description="Noctury TTS Server — Qwen3-TTS Self-Hosted with Voice Cloning"
+
+# Install all dependencies in one layer
 RUN apt-get update && apt-get install -y --no-install-recommends \
     python3 \
     python3-pip \
     python3-dev \
     python3-venv \
     git \
+    git-lfs \
     build-essential \
     ffmpeg \
     sox \
     libsox-fmt-all \
     libsndfile1-dev \
     libmagic1 \
-    && rm -rf /var/lib/apt/lists/*
+    curl \
+    && rm -rf /var/lib/apt/lists/* \
+    && apt-get clean \
+    && git lfs install
 
 # Create virtual environment
 RUN python3 -m venv /opt/venv
@@ -39,45 +45,11 @@ RUN pip install --no-cache-dir torch torchaudio --index-url https://download.pyt
 COPY requirements.txt /tmp/
 RUN pip install --no-cache-dir -r /tmp/requirements.txt
 
-# Install flash-attention from pre-built wheel
+# Try to install flash-attention (optional, non-blocking)
 RUN pip install --no-cache-dir https://github.com/mjun0812/flash-attention-prebuild-wheels/releases/download/v0.7.12/flash_attn-2.6.3+cu128torch2.10-cp310-cp310-linux_x86_64.whl || true
 
-# Pre-download models to cache them in the image
-RUN python -c "from huggingface_hub import snapshot_download; snapshot_download('Qwen/Qwen3-TTS-12Hz-1.7B-Base')"
-RUN python -c "from huggingface_hub import snapshot_download; snapshot_download('Qwen/Qwen3-TTS-Tokenizer-12Hz')"
-RUN python -c "import whisper; whisper.load_model('base')"
-
-# =============================================================================
-# Stage 2: Runtime - Minimal image with only runtime dependencies
-# =============================================================================
-FROM ${DOCKER_FROM} AS runtime
-
-ARG DEBIAN_FRONTEND=noninteractive
-
-LABEL maintainer="Noctury / ShopAdventure"
-LABEL description="Noctury TTS Server — Qwen3-TTS Self-Hosted with Voice Cloning"
-
-# Install only runtime dependencies
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    python3 \
-    python3-pip \
-    ffmpeg \
-    sox \
-    libsox-fmt-all \
-    libsndfile1 \
-    libmagic1 \
-    git \
-    git-lfs \
-    && rm -rf /var/lib/apt/lists/* \
-    && apt-get clean \
-    && git lfs install
-
-# Copy virtual environment from builder
-COPY --from=builder /opt/venv /opt/venv
-ENV PATH="/opt/venv/bin:$PATH"
-
-# Copy cached models from builder
-COPY --from=builder /root/.cache /root/.cache
+# NOTE: Models are NOT downloaded during build to keep the image small (~5GB)
+# They will be downloaded at first startup via start.sh
 
 ENV SHELL=/bin/bash
 ENV PYTHONUNBUFFERED=1
@@ -106,12 +78,12 @@ RUN sed -i 's/\r$//' /app/server/start.sh \
 
 WORKDIR /app/server
 
-# Expose the server port
+# Expose the server port (RunPod will use PORT env var)
 EXPOSE 7860
 
-# Health check
-HEALTHCHECK --interval=30s --timeout=10s --start-period=120s --retries=3 \
-    CMD python3 -c "import urllib.request; urllib.request.urlopen('http://localhost:7860/health')" || exit 1
+# Health check on dynamic port
+HEALTHCHECK --interval=30s --timeout=10s --start-period=300s --retries=5 \
+    CMD curl -f http://localhost:${PORT:-7860}/ping || exit 1
 
 # Set the entrypoint
 ENTRYPOINT ["/bin/bash", "/app/server/start.sh"]
