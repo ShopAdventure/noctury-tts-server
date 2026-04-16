@@ -74,14 +74,13 @@ voice_cache = {}
 
 
 # ─── Authentication ──────────────────────────────────────────────────────────
-def verify_api_key(authorization: Optional[str] = Header(None)):
-    """Verify API key if one is configured."""
+def verify_api_key(x_noctury_key: Optional[str] = Header(None)):
+    """Verify API key if one is configured (reads from X-Noctury-Key header)."""
     if not API_KEY:
         return True
-    if not authorization:
-        raise HTTPException(status_code=401, detail="Missing Authorization header")
-    token = authorization.replace("Bearer ", "").strip()
-    if token != API_KEY:
+    if not x_noctury_key:
+        raise HTTPException(status_code=401, detail="Missing X-Noctury-Key header")
+    if x_noctury_key.strip() != API_KEY:
         raise HTTPException(status_code=403, detail="Invalid API key")
     return True
 
@@ -439,9 +438,9 @@ async def health():
 
 
 @app.get("/voices")
-async def list_voices(authorization: Optional[str] = Header(None)):
+async def list_voices(x_noctury_key: Optional[str] = Header(None)):
     """List all available voices."""
-    verify_api_key(authorization)
+    verify_api_key(x_noctury_key)
     voices = []
     for f in os.listdir(resources_dir):
         name = os.path.splitext(f)[0]
@@ -477,10 +476,10 @@ async def startup_event():
 async def upload_audio(
     audio_file_label: str = Form(...),
     file: UploadFile = File(...),
-    authorization: Optional[str] = Header(None),
+    x_noctury_key: Optional[str] = Header(None),
 ):
     """Upload an audio file for later use as the reference audio."""
-    verify_api_key(authorization)
+    verify_api_key(x_noctury_key)
     try:
         contents = await file.read()
 
@@ -529,10 +528,10 @@ async def synthesize_speech(
     voice: str,
     speed: Optional[float] = None,
     language: Optional[str] = None,
-    authorization: Optional[str] = Header(None),
+    x_noctury_key: Optional[str] = Header(None),
 ):
     """Synthesize speech from text using a specified voice (single chunk)."""
-    verify_api_key(authorization)
+    verify_api_key(x_noctury_key)
     start_time = time.time()
     try:
         logging.info(f"Generating speech for voice: {voice}")
@@ -588,7 +587,7 @@ class EpisodeRequest(BaseModel):
 @app.post("/generate_episode/")
 async def generate_episode(
     request: EpisodeRequest,
-    authorization: Optional[str] = Header(None),
+    x_noctury_key: Optional[str] = Header(None),
 ):
     """
     Generate a full episode audio from long text using intelligent chunking.
@@ -598,7 +597,7 @@ async def generate_episode(
     separately with the cloned voice, and all chunks are assembled with crossfade
     into a single seamless audio file.
     """
-    verify_api_key(authorization)
+    verify_api_key(x_noctury_key)
     total_start = time.time()
 
     try:
@@ -710,13 +709,13 @@ async def generate_episode(
 @app.post("/generate_episode_json/")
 async def generate_episode_json(
     request: EpisodeRequest,
-    authorization: Optional[str] = Header(None),
+    x_noctury_key: Optional[str] = Header(None),
 ):
     """
     Same as /generate_episode/ but returns JSON metadata with chunk details.
     The audio file is saved on the server and can be downloaded via /download/.
     """
-    verify_api_key(authorization)
+    verify_api_key(x_noctury_key)
     total_start = time.time()
 
     try:
@@ -807,10 +806,10 @@ async def generate_episode_json(
 @app.get("/download/{filename}")
 async def download_file(
     filename: str,
-    authorization: Optional[str] = Header(None),
+    x_noctury_key: Optional[str] = Header(None),
 ):
     """Download a generated audio file."""
-    verify_api_key(authorization)
+    verify_api_key(x_noctury_key)
     file_path = f"{output_dir}/{filename}"
     if not os.path.exists(file_path):
         raise HTTPException(status_code=404, detail="File not found")
@@ -823,10 +822,10 @@ async def download_file(
 async def change_voice(
     reference_speaker: str = Form(...),
     file: UploadFile = File(...),
-    authorization: Optional[str] = Header(None),
+    x_noctury_key: Optional[str] = Header(None),
 ):
     """Change the voice of an existing audio file."""
-    verify_api_key(authorization)
+    verify_api_key(x_noctury_key)
     try:
         logging.info(f"Changing voice to {reference_speaker}...")
 
