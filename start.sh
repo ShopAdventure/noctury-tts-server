@@ -12,12 +12,21 @@ cd "$(dirname "$0")"
 # Add the current directory to PYTHONPATH
 export PYTHONPATH="$PYTHONPATH:$(pwd)"
 
-# ─── Download models if not already cached ────────────────────────────────────
-# Models are downloaded at first startup and cached in HF_HOME (/root/.cache/huggingface)
-# On RunPod, this cache persists across restarts if a network volume is mounted.
-# Subsequent starts are fast (~30s) since models are already cached.
-echo "=== Checking/Downloading models ==="
-python3 /app/server/download_models.py
+# ─── Network Volume: use pre-loaded models if available ───────────────────────
+VOLUME_MODELS="/runpod-volume/models"
+
+if [ -d "$VOLUME_MODELS/Qwen3-TTS-12Hz-1.7B-Base" ] && [ -d "$VOLUME_MODELS/Qwen3-TTS-12Hz-1.7B-VoiceDesign" ]; then
+    echo "=== Network Volume detected — using pre-loaded models (fast cold start) ==="
+    export NOCTURY_MODEL_BASE="$VOLUME_MODELS/Qwen3-TTS-12Hz-1.7B-Base"
+    export NOCTURY_MODEL_VOICEDESIGN="$VOLUME_MODELS/Qwen3-TTS-12Hz-1.7B-VoiceDesign"
+    export NOCTURY_MODEL_COSYVOICE="$VOLUME_MODELS/CosyVoice2-0.5B"
+    echo "  Base model: $NOCTURY_MODEL_BASE"
+    echo "  VoiceDesign model: $NOCTURY_MODEL_VOICEDESIGN"
+    echo "  CosyVoice2: $NOCTURY_MODEL_COSYVOICE"
+else
+    echo "=== No network volume — downloading models from HuggingFace ==="
+    python3 /app/server/download_models.py
+fi
 
 echo "=== Models ready ==="
 

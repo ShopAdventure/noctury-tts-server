@@ -49,17 +49,32 @@ device = "cuda:0" if torch.cuda.is_available() else "cpu"
 # ─── Model Loading ───────────────────────────────────────────────────────────
 from qwen_tts import Qwen3TTSModel
 
-logging.info(f"Loading Qwen3-TTS Base model on {device}...")
+# Prioritize network volume models for fast cold start
+_VOLUME_MODELS = "/runpod-volume/models"
+_BASE_MODEL_PATH = os.environ.get(
+    "NOCTURY_MODEL_BASE",
+    os.path.join(_VOLUME_MODELS, "Qwen3-TTS-12Hz-1.7B-Base")
+    if os.path.isdir(os.path.join(_VOLUME_MODELS, "Qwen3-TTS-12Hz-1.7B-Base"))
+    else "Qwen/Qwen3-TTS-12Hz-1.7B-Base"
+)
+_VOICEDESIGN_MODEL_PATH = os.environ.get(
+    "NOCTURY_MODEL_VOICEDESIGN",
+    os.path.join(_VOLUME_MODELS, "Qwen3-TTS-12Hz-1.7B-VoiceDesign")
+    if os.path.isdir(os.path.join(_VOLUME_MODELS, "Qwen3-TTS-12Hz-1.7B-VoiceDesign"))
+    else "Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign"
+)
+
+logging.info(f"Loading Qwen3-TTS Base model from: {_BASE_MODEL_PATH}")
 model = Qwen3TTSModel.from_pretrained(
-    "Qwen/Qwen3-TTS-12Hz-1.7B-Base",
+    _BASE_MODEL_PATH,
     device_map=device,
     dtype=torch.bfloat16,
 )
 logging.info("Qwen3-TTS Base model loaded successfully")
 
-logging.info(f"Loading Qwen3-TTS VoiceDesign model on {device}...")
+logging.info(f"Loading Qwen3-TTS VoiceDesign model from: {_VOICEDESIGN_MODEL_PATH}")
 voice_design_model = Qwen3TTSModel.from_pretrained(
-    "Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign",
+    _VOICEDESIGN_MODEL_PATH,
     device_map=device,
     dtype=torch.bfloat16,
 )
