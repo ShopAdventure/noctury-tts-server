@@ -12,8 +12,9 @@ cd "$(dirname "$0")"
 # Add the current directory to PYTHONPATH
 export PYTHONPATH="$PYTHONPATH:$(pwd)"
 
-# ─── Download models if not already cached ───────────────────────────────────
-echo "=== Checking/Downloading models ==="
+# ─── Models are pre-baked in the image (downloaded at build time) ─────────────
+# local_files_only=True ensures we never try to re-download at runtime
+echo "=== Verifying pre-baked models ==="
 
 python3 -c "
 from huggingface_hub import snapshot_download
@@ -26,15 +27,10 @@ models = [
 
 for model in models:
     print(f'Checking model: {model}')
-    try:
-        path = snapshot_download(model)
-        print(f'  -> Ready at: {path}')
-    except Exception as e:
-        print(f'  -> Downloading: {model}')
-        path = snapshot_download(model)
-        print(f'  -> Downloaded to: {path}')
+    path = snapshot_download(model, local_files_only=True)
+    print(f'  -> Ready at: {path}')
 
-# Download whisper base model
+# Verify whisper base model
 print('Checking Whisper base model...')
 import whisper
 whisper.load_model('base')

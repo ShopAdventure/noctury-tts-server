@@ -2,7 +2,7 @@
 # Noctury TTS Server — Qwen3-TTS Self-Hosted
 # Optimized for RunPod Serverless Load Balancing
 # Base: nvidia/cuda (lightweight) + PyTorch via pip
-# Models downloaded at first startup (not baked into image)
+# Models pre-baked into image for fast cold start (~30s instead of 8min)
 # =============================================================================
 
 FROM nvidia/cuda:12.1.0-base-ubuntu22.04
@@ -68,6 +68,22 @@ COPY resources/.gitkeep /app/server/resources/.gitkeep
 # Fix line endings and make executable
 RUN sed -i 's/\r$//' /app/server/start.sh \
     && chmod +x /app/server/start.sh
+
+# Pre-download models at build time for fast cold start
+# This bakes the models into the image (~8GB total) so RunPod
+# doesn't need to download them at runtime (cold start: 8min -> 30s)
+ENV HF_HOME=/root/.cache/huggingface
+RUN python3 -c "
+from huggingface_hub import snapshot_download
+import whisper
+print('Pre-downloading Qwen3-TTS-12Hz-1.7B-Base...')
+snapshot_download('Qwen/Qwen3-TTS-12Hz-1.7B-Base')
+print('Pre-downloading Qwen3-TTS-Tokenizer-12Hz...')
+snapshot_download('Qwen/Qwen3-TTS-Tokenizer-12Hz')
+print('Pre-downloading Whisper base...')
+whisper.load_model('base')
+print('All models pre-downloaded successfully.')
+"
 
 WORKDIR /app/server
 
