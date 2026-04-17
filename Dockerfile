@@ -54,12 +54,16 @@ ENV MAX_NEW_TOKENS=4096
 ENV CHUNK_MAX_CHARS=400
 ENV CROSSFADE_MS=200
 
+# HuggingFace cache directory
+ENV HF_HOME=/root/.cache/huggingface
+
 # Create necessary directories
 RUN mkdir -p /app/server/outputs /app/server/resources
 
 # Copy server files
 COPY server.py /app/server/
 COPY start.sh /app/server/
+COPY download_models.py /app/server/
 
 # Copy voice reference files (Maxime voice sample for cloning)
 COPY resources/maxime.mp3 /app/server/resources/maxime.mp3
@@ -72,18 +76,7 @@ RUN sed -i 's/\r$//' /app/server/start.sh \
 # Pre-download models at build time for fast cold start
 # This bakes the models into the image (~8GB total) so RunPod
 # doesn't need to download them at runtime (cold start: 8min -> 30s)
-ENV HF_HOME=/root/.cache/huggingface
-RUN python3 -c "
-from huggingface_hub import snapshot_download
-import whisper
-print('Pre-downloading Qwen3-TTS-12Hz-1.7B-Base...')
-snapshot_download('Qwen/Qwen3-TTS-12Hz-1.7B-Base')
-print('Pre-downloading Qwen3-TTS-Tokenizer-12Hz...')
-snapshot_download('Qwen/Qwen3-TTS-Tokenizer-12Hz')
-print('Pre-downloading Whisper base...')
-whisper.load_model('base')
-print('All models pre-downloaded successfully.')
-"
+RUN python3 /app/server/download_models.py
 
 WORKDIR /app/server
 
