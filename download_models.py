@@ -7,6 +7,7 @@ import whisper
 
 models = [
     "Qwen/Qwen3-TTS-12Hz-1.7B-Base",
+    "Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign",
     "Qwen/Qwen3-TTS-Tokenizer-12Hz",
 ]
 

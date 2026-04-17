@@ -10,7 +10,7 @@ FROM nvidia/cuda:12.1.0-base-ubuntu22.04
 ARG DEBIAN_FRONTEND=noninteractive
 
 LABEL maintainer="Noctury / ShopAdventure"
-LABEL description="Noctury TTS Server — Qwen3-TTS with Voice Cloning"
+LABEL description="Noctury TTS Server — Qwen3-TTS Base (Voice Cloning) + VoiceDesign (Prompt-based)"
 
 # Install system dependencies
 RUN apt-get update && apt-get install -y --no-install-recommends \

@@ -49,13 +49,21 @@ device = "cuda:0" if torch.cuda.is_available() else "cpu"
 # ─── Model Loading ───────────────────────────────────────────────────────────
 from qwen_tts import Qwen3TTSModel
 
-logging.info(f"Loading Qwen3-TTS model on {device}...")
+logging.info(f"Loading Qwen3-TTS Base model on {device}...")
 model = Qwen3TTSModel.from_pretrained(
     "Qwen/Qwen3-TTS-12Hz-1.7B-Base",
     device_map=device,
     dtype=torch.bfloat16,
 )
-logging.info("Qwen3-TTS model loaded successfully")
+logging.info("Qwen3-TTS Base model loaded successfully")
+
+logging.info(f"Loading Qwen3-TTS VoiceDesign model on {device}...")
+voice_design_model = Qwen3TTSModel.from_pretrained(
+    "Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign",
+    device_map=device,
+    dtype=torch.bfloat16,
+)
+logging.info("Qwen3-TTS VoiceDesign model loaded successfully")
 
 import whisper
 
@@ -434,6 +442,7 @@ async def health():
         "default_speed": DEFAULT_SPEED,
         "chunk_max_chars": CHUNK_MAX_CHARS,
         "voices_loaded": list(voice_cache.keys()),
+        "voice_design_model": "Qwen3-TTS-12Hz-1.7B-VoiceDesign",
     }
 
 
@@ -470,6 +479,137 @@ async def startup_event():
             logging.info("Warmup complete — voice cached")
         except Exception as e:
             logging.warning(f"Warmup failed: {e}")
+
+
+@app.get("/synthesize_speech_design/")
+async def synthesize_speech_design(
+    text: str,
+    instruct: str,
+    speed: Optional[float] = None,
+    language: Optional[str] = None,
+    x_noctury_key: Optional[str] = Header(None),
+):
+    """
+    Synthesize speech using a text description (VoiceDesign model).
+    No reference audio needed — describe the voice you want.
+
+    Examples:
+      instruct="Femme, 30 ans, voix douce et intime, accent parisien, ton narratif chaleureux"
+      instruct="Femme, 25 ans, voix sensuelle et profonde, débit lent, murmure complice"
+    """
+    verify_api_key(x_noctury_key)
+    start_time = time.time()
+    try:
+        lang = language or DEFAULT_LANGUAGE
+        spd = speed or DEFAULT_SPEED
+
+        logging.info(f"VoiceDesign generation | lang={lang} | instruct={instruct[:80]}")
+
+        wavs, sr = voice_design_model.generate_voice_design(
+            text=text,
+            language=lang,
+            instruct=instruct,
+            max_new_tokens=MAX_NEW_TOKENS,
+        )
+
+        audio_data = wavs[0]
+
+        save_path = f"{output_dir}/output_voice_design.wav"
+        sf.write(save_path, audio_data, sr)
+
+        elapsed = time.time() - start_time
+        result = StreamingResponse(open(save_path, "rb"), media_type="audio/wav")
+        result.headers["X-Elapsed-Time"] = str(round(elapsed, 2))
+        result.headers["X-Device-Used"] = device
+        result.headers["X-Audio-Duration"] = str(round(len(audio_data) / sr, 2))
+        result.headers["Access-Control-Allow-Origin"] = "*"
+        return result
+
+    except Exception as e:
+        logging.error(f"Error in synthesize_speech_design: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+class EpisodeDesignRequest(BaseModel):
+    """Request body for episode generation with VoiceDesign."""
+    text: str
+    instruct: str
+    speed: Optional[float] = None
+    language: Optional[str] = None
+    chunk_max_chars: Optional[int] = None
+    output_format: Optional[str] = "wav"
+
+
+@app.post("/generate_episode_design/")
+async def generate_episode_design(
+    request: EpisodeDesignRequest,
+    x_noctury_key: Optional[str] = Header(None),
+):
+    """
+    Generate a full episode from long text using VoiceDesign (no reference audio).
+    The text is split into chunks, each generated with the described voice,
+    then assembled into a single seamless audio file.
+    """
+    verify_api_key(x_noctury_key)
+    total_start = time.time()
+    try:
+        lang = request.language or DEFAULT_LANGUAGE
+        chunk_max = request.chunk_max_chars or CHUNK_MAX_CHARS
+
+        logging.info(f"=== EPISODE DESIGN GENERATION START ===")
+        logging.info(f"Instruct: {request.instruct[:80]} | Text: {len(request.text)} chars")
+
+        chunks = split_text_into_chunks(request.text, max_chars=chunk_max)
+        logging.info(f"Text split into {len(chunks)} chunks")
+
+        audio_chunks = []
+        sr = None
+
+        for i, chunk_text in enumerate(chunks):
+            chunk_start = time.time()
+            logging.info(f"Chunk {i+1}/{len(chunks)}: '{chunk_text[:60]}...'")
+
+            wavs, chunk_sr = voice_design_model.generate_voice_design(
+                text=chunk_text,
+                language=lang,
+                instruct=request.instruct,
+                max_new_tokens=MAX_NEW_TOKENS,
+            )
+
+            if sr is None:
+                sr = chunk_sr
+
+            audio_chunks.append(wavs[0])
+            logging.info(f"Chunk {i+1} done in {time.time()-chunk_start:.1f}s")
+
+        final_audio = assemble_chunks_audio(audio_chunks, sr)
+        total_duration = len(final_audio) / sr
+
+        save_path = f"{output_dir}/episode_design_output.wav"
+        sf.write(save_path, final_audio, sr)
+
+        if request.output_format == "mp3":
+            mp3_path = f"{output_dir}/episode_design_output.mp3"
+            AudioSegment.from_wav(save_path).export(mp3_path, format="mp3", bitrate="192k")
+            save_path = mp3_path
+            media_type = "audio/mpeg"
+        else:
+            media_type = "audio/wav"
+
+        total_time = time.time() - total_start
+        logging.info(f"=== EPISODE DESIGN COMPLETE: {total_duration:.1f}s audio in {total_time:.1f}s ===")
+
+        result = StreamingResponse(open(save_path, "rb"), media_type=media_type)
+        result.headers["X-Total-Time"] = str(round(total_time, 2))
+        result.headers["X-Audio-Duration"] = str(round(total_duration, 2))
+        result.headers["X-Chunks-Count"] = str(len(chunks))
+        result.headers["X-Device-Used"] = device
+        result.headers["Access-Control-Allow-Origin"] = "*"
+        return result
+
+    except Exception as e:
+        logging.error(f"Error in generate_episode_design: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.post("/upload_audio/")
