@@ -2,7 +2,7 @@
 # Noctury TTS Server — Qwen3-TTS Self-Hosted
 # Optimized for RunPod Serverless Load Balancing
 # Base: nvidia/cuda (lightweight) + PyTorch via pip
-# Models pre-baked into image for fast cold start (~30s instead of 8min)
+# Models downloaded at first container startup (cached on RunPod volume)
 # =============================================================================
 
 FROM nvidia/cuda:12.1.0-base-ubuntu22.04
@@ -54,7 +54,7 @@ ENV MAX_NEW_TOKENS=4096
 ENV CHUNK_MAX_CHARS=400
 ENV CROSSFADE_MS=200
 
-# HuggingFace cache directory
+# HuggingFace cache directory (models downloaded at first startup)
 ENV HF_HOME=/root/.cache/huggingface
 
 # Create necessary directories
@@ -65,18 +65,18 @@ COPY server.py /app/server/
 COPY start.sh /app/server/
 COPY download_models.py /app/server/
 
-# Copy voice reference files (Maxime voice sample for cloning)
+# Copy voice reference files
 COPY resources/maxime.mp3 /app/server/resources/maxime.mp3
+COPY resources/clara.mp3 /app/server/resources/clara.mp3
 COPY resources/.gitkeep /app/server/resources/.gitkeep
 
 # Fix line endings and make executable
 RUN sed -i 's/\r$//' /app/server/start.sh \
     && chmod +x /app/server/start.sh
 
-# Pre-download models at build time for fast cold start
-# This bakes the models into the image (~8GB total) so RunPod
-# doesn't need to download them at runtime (cold start: 8min -> 30s)
-RUN python3 /app/server/download_models.py
+# NOTE: Models are NOT pre-baked here (would OOM on GitHub Actions 7GB runner).
+# They are downloaded at first container startup via download_models.py in start.sh.
+# RunPod volume at /root/.cache/huggingface persists models across restarts.
 
 WORKDIR /app/server
 
@@ -84,7 +84,7 @@ WORKDIR /app/server
 EXPOSE 8000
 
 # Health check
-HEALTHCHECK --interval=30s --timeout=10s --start-period=300s --retries=5 \
+HEALTHCHECK --interval=30s --timeout=10s --start-period=600s --retries=10 \
     CMD curl -f http://localhost:${PORT:-8000}/ping || exit 1
 
 ENTRYPOINT ["/bin/bash", "/app/server/start.sh"]

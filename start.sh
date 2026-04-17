@@ -12,31 +12,12 @@ cd "$(dirname "$0")"
 # Add the current directory to PYTHONPATH
 export PYTHONPATH="$PYTHONPATH:$(pwd)"
 
-# ─── Models are pre-baked in the image (downloaded at build time) ─────────────
-# local_files_only=True ensures we never try to re-download at runtime
-echo "=== Verifying pre-baked models ==="
-
-python3 -c "
-from huggingface_hub import snapshot_download
-import os
-
-models = [
-    'Qwen/Qwen3-TTS-12Hz-1.7B-Base',
-    'Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign',
-    'Qwen/Qwen3-TTS-Tokenizer-12Hz',
-]
-
-for model in models:
-    print(f'Checking model: {model}')
-    path = snapshot_download(model, local_files_only=True)
-    print(f'  -> Ready at: {path}')
-
-# Verify whisper base model
-print('Checking Whisper base model...')
-import whisper
-whisper.load_model('base')
-print('  -> Whisper ready')
-"
+# ─── Download models if not already cached ────────────────────────────────────
+# Models are downloaded at first startup and cached in HF_HOME (/root/.cache/huggingface)
+# On RunPod, this cache persists across restarts if a network volume is mounted.
+# Subsequent starts are fast (~30s) since models are already cached.
+echo "=== Checking/Downloading models ==="
+python3 /app/server/download_models.py
 
 echo "=== Models ready ==="
 
