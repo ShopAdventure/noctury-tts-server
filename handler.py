@@ -57,22 +57,21 @@ MODELS_LOADED = False
 MODELS_ERROR = None
 
 try:
-    import qwen_tts
+    from qwen_tts import Qwen3TTSModel
 
     # Chemin du modèle VoiceDesign
-    vd_path = None
     candidate_vd = os.path.join(VOLUME_MODELS, "Qwen3-TTS-12Hz-1.7B-VoiceDesign")
     if os.path.isdir(candidate_vd):
         vd_path = candidate_vd
         logger.info(f"[Handler] VoiceDesign depuis volume: {vd_path}")
     else:
-        vd_path = "Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign"
-        logger.info(f"[Handler] VoiceDesign depuis HuggingFace: {vd_path}")
-        logger.warning(f"[Handler] Volume non trouvé à {candidate_vd} — téléchargement depuis HuggingFace")
+        vd_path = os.getenv("NOCTURY_MODEL_VOICEDESIGN", "Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign")
+        logger.warning(f"[Handler] Volume non trouvé à {candidate_vd} — utilisation de: {vd_path}")
 
-    voice_design_model = qwen_tts.VoiceDesign(
-        model_name_or_path=vd_path,
-        device=device,
+    voice_design_model = Qwen3TTSModel.from_pretrained(
+        vd_path,
+        device_map=device,
+        dtype=torch.bfloat16,
     )
     MODELS_LOADED = True
     logger.info("[Handler] Modèle VoiceDesign chargé avec succès")
