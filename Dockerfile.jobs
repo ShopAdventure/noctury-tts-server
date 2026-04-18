@@ -73,3 +73,5 @@ WORKDIR /app/server
 
 # Direct entrypoint — no sleep infinity, no FastAPI
 CMD ["/bin/bash", "/app/server/start_jobs.sh"]
+
+# Force rebuild 20260418-130316 — fix dockerArgs vide
