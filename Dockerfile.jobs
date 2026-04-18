@@ -1,0 +1,94 @@
+# =============================================================================
+# Noctury TTS Server — RunPod Jobs Handler
+# Optimized for RunPod Queue-based Serverless (async jobs, no HTTP timeout)
+# =============================================================================
+
+FROM nvidia/cuda:12.1.0-base-ubuntu22.04
+
+ARG DEBIAN_FRONTEND=noninteractive
+
+LABEL maintainer="Noctury / ShopAdventure"
+LABEL description="Noctury TTS Jobs Handler — RunPod Queue-based async generation"
+
+# Install system dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    python3 \
+    python3-pip \
+    python3-dev \
+    ffmpeg \
+    libsndfile1-dev \
+    libmagic1 \
+    curl \
+    git \
+    && rm -rf /var/lib/apt/lists/* \
+    && apt-get clean
+
+# CUDA compat
+RUN ldconfig /usr/local/cuda-12.1/compat/
+
+# Upgrade pip
+RUN pip3 install --no-cache-dir --upgrade pip setuptools wheel
+
+# Install PyTorch with CUDA 12.1 support
+RUN pip3 install --no-cache-dir \
+    torch==2.5.1 \
+    torchaudio==2.5.1 \
+    --index-url https://download.pytorch.org/whl/cu121
+
+# Install Python dependencies
+COPY requirements.txt /tmp/
+RUN pip3 install --no-cache-dir -r /tmp/requirements.txt
+
+# Try flash-attention (optional, non-blocking)
+RUN pip3 install --no-cache-dir flash-attn --no-build-isolation 2>/dev/null || true
+
+ENV SHELL=/bin/bash
+ENV PYTHONUNBUFFERED=1
+
+# Noctury default configuration
+ENV DEFAULT_LANGUAGE=French
+ENV MAX_NEW_TOKENS=4096
+ENV CHUNK_MAX_CHARS=1600
+ENV CROSSFADE_MS=200
+ENV VD_TEMPERATURE=0.7
+ENV VD_TOP_K=30
+ENV VD_TOP_P=0.85
+ENV VD_REPETITION_PENALTY=1.1
+
+# HuggingFace cache directory (models downloaded at first startup)
+ENV HF_HOME=/root/.cache/huggingface
+
+# Create necessary directories
+RUN mkdir -p /app/server/outputs /app/server/resources
+
+# Copy handler and dependencies
+COPY handler.py /app/server/
+COPY download_models.py /app/server/
+
+# Copy voice reference files
+COPY resources/maxime.mp3 /app/server/resources/maxime.mp3
+COPY resources/clara.mp3 /app/server/resources/clara.mp3
+COPY resources/.gitkeep /app/server/resources/.gitkeep
+
+WORKDIR /app/server
+
+# Start script for Jobs handler: download models then start handler
+RUN echo '#!/bin/bash\n\
+echo "=== Noctury TTS Jobs Handler Starting ==="\n\
+echo "Device: $(python3 -c '"'"'import torch; print("CUDA" if torch.cuda.is_available() else "CPU")'"'"')"\n\
+\n\
+VOLUME_MODELS="/runpod-volume/models"\n\
+if [ -d "$VOLUME_MODELS/Qwen3-TTS-12Hz-1.7B-VoiceDesign" ]; then\n\
+    echo "Network Volume detected — using pre-loaded models"\n\
+    export NOCTURY_MODEL_VOICEDESIGN="$VOLUME_MODELS/Qwen3-TTS-12Hz-1.7B-VoiceDesign"\n\
+else\n\
+    echo "Downloading VoiceDesign model from HuggingFace..."\n\
+    python3 /app/server/download_models.py\n\
+fi\n\
+\n\
+echo "Starting RunPod Jobs Handler..."\n\
+exec python3 /app/server/handler.py\n\
+' > /app/server/start_jobs.sh && chmod +x /app/server/start_jobs.sh
+
+# Direct entrypoint — no sleep infinity, no FastAPI
+CMD ["/bin/bash", "/app/server/start_jobs.sh"]
