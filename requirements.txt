@@ -9,3 +9,4 @@ qwen-tts
 openai-whisper>=20250625
 librosa>=0.11.0
 runpod>=1.7.0
+boto3>=1.34.0

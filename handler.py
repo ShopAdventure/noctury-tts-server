@@ -27,13 +27,62 @@ import base64
 import io
 import hashlib
 import logging
+import uuid
 import numpy as np
+import boto3
+from botocore.client import Config
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
 
 # ─── Configuration ────────────────────────────────────────────────────────────
 DEFAULT_LANGUAGE = os.getenv("DEFAULT_LANGUAGE", "French")
+
+# ─── Cloudflare R2 ────────────────────────────────────────────────────────────
+R2_ENDPOINT = os.getenv("R2_ENDPOINT", "")
+R2_ACCESS_KEY_ID = os.getenv("R2_ACCESS_KEY_ID", "")
+R2_SECRET_ACCESS_KEY = os.getenv("R2_SECRET_ACCESS_KEY", "")
+R2_BUCKET = os.getenv("R2_BUCKET", "")
+R2_PUBLIC_URL = os.getenv("R2_PUBLIC_URL", "").rstrip("/")
+
+def upload_audio_to_r2(audio_data: np.ndarray, sample_rate: int, prefix: str = "jobs") -> str:
+    """Convertit l'audio en MP3 et l'uploade sur R2. Retourne l'URL publique."""
+    import soundfile as sf
+    from pydub import AudioSegment
+
+    # WAV en mémoire
+    wav_buf = io.BytesIO()
+    sf.write(wav_buf, audio_data, sample_rate, format="WAV")
+    wav_buf.seek(0)
+
+    # Conversion WAV → MP3 192kbps
+    segment = AudioSegment.from_wav(wav_buf)
+    mp3_buf = io.BytesIO()
+    segment.export(mp3_buf, format="mp3", bitrate="192k")
+    mp3_buf.seek(0)
+    mp3_bytes = mp3_buf.read()
+
+    # Upload sur R2
+    filename = f"{prefix}/{uuid.uuid4().hex}.mp3"
+    s3 = boto3.client(
+        "s3",
+        endpoint_url=R2_ENDPOINT,
+        aws_access_key_id=R2_ACCESS_KEY_ID,
+        aws_secret_access_key=R2_SECRET_ACCESS_KEY,
+        config=Config(signature_version="s3v4"),
+        region_name="auto",
+    )
+    s3.put_object(
+        Bucket=R2_BUCKET,
+        Key=filename,
+        Body=mp3_bytes,
+        ContentType="audio/mpeg",
+    )
+    url = f"{R2_PUBLIC_URL}/{filename}"
+    logger.info(f"[R2] Upload terminé : {url} ({len(mp3_bytes)/1024:.0f} KB)")
+    return url
+
+
 MAX_NEW_TOKENS = int(os.getenv("MAX_NEW_TOKENS", "4096"))
 CHUNK_MAX_CHARS = int(os.getenv("CHUNK_MAX_CHARS", "1600"))
 CROSSFADE_MS = int(os.getenv("CROSSFADE_MS", "200"))
@@ -232,16 +281,40 @@ def handle_generate_episode_design(job_input: dict) -> dict:
 
     logger.info(f"[Jobs] Assemblage terminé : {total_duration:.1f}s audio en {total_elapsed:.1f}s")
 
-    audio_b64 = wav_to_base64(final_audio, sample_rate)
+    # Upload sur R2 si configuré, sinon fallback base64 (petits audios seulement)
+    audio_size_mb = len(final_audio) * 4 / (1024 * 1024)  # float32 = 4 bytes
+    if R2_ENDPOINT and R2_ACCESS_KEY_ID and R2_BUCKET:
+        try:
+            audio_url = upload_audio_to_r2(final_audio, sample_rate, prefix="jobs")
+            return {
+                "audio_url": audio_url,
+                "duration": round(total_duration, 2),
+                "sample_rate": sample_rate,
+                "chunks": len(chunks),
+                "elapsed": round(total_elapsed, 2),
+                "instruct_enriched": enriched_instruct,
+            }
+        except Exception as e:
+            logger.error(f"[R2] Erreur upload : {e} — fallback base64")
 
-    return {
-        "audio_b64": audio_b64,
-        "duration": round(total_duration, 2),
-        "sample_rate": sample_rate,
-        "chunks": len(chunks),
-        "elapsed": round(total_elapsed, 2),
-        "instruct_enriched": enriched_instruct,
-    }
+    # Fallback base64 (pour petits audios < 5 MB)
+    if audio_size_mb < 5:
+        audio_b64 = wav_to_base64(final_audio, sample_rate)
+        return {
+            "audio_b64": audio_b64,
+            "duration": round(total_duration, 2),
+            "sample_rate": sample_rate,
+            "chunks": len(chunks),
+            "elapsed": round(total_elapsed, 2),
+            "instruct_enriched": enriched_instruct,
+        }
+    else:
+        return {
+            "error": f"Audio trop volumineux ({audio_size_mb:.1f} MB) et R2 non configuré — configurez R2_ENDPOINT, R2_ACCESS_KEY_ID, R2_BUCKET, R2_PUBLIC_URL",
+            "duration": round(total_duration, 2),
+            "chunks": len(chunks),
+            "elapsed": round(total_elapsed, 2),
+        }
 
 
 def handle_health() -> dict:
