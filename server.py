@@ -407,6 +407,26 @@ def audio_to_wav_bytes(audio_data: np.ndarray, sr: int) -> io.BytesIO:
     return buffer
 
 
+def voice_seed(instruct: str) -> int:
+    """
+    Dérive un seed déterministe depuis le prompt instruct.
+    Tous les chunks d'un même épisode utilisent le même seed
+    → même caractéristiques de voix (timbre, ton, accent) sur tous les chunks.
+    """
+    import hashlib
+    h = int(hashlib.md5(instruct.encode("utf-8")).hexdigest(), 16) % (2**31)
+    return h
+
+
+def set_voice_seed(instruct: str) -> None:
+    """Fixe le seed PyTorch/CUDA dérivé du prompt instruct."""
+    seed = voice_seed(instruct)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+    logging.info(f"Voice seed set to {seed} (from instruct hash)")
+
+
 def assemble_chunks_audio(audio_chunks: List[np.ndarray], sr: int) -> np.ndarray:
     """
     Assemble multiple audio chunks into a single audio with crossfade.
@@ -523,6 +543,7 @@ async def synthesize_speech_design(
 
         logging.info(f"VoiceDesign generation | lang={lang} | instruct={instruct[:80]}")
 
+        set_voice_seed(instruct)
         wavs, sr = voice_design_model.generate_voice_design(
             text=text,
             language=lang,
@@ -587,6 +608,7 @@ async def generate_episode_design(
             chunk_start = time.time()
             logging.info(f"Chunk {i+1}/{len(chunks)}: '{chunk_text[:60]}...'")
 
+            set_voice_seed(request.instruct)
             wavs, chunk_sr = voice_design_model.generate_voice_design(
                 text=chunk_text,
                 language=lang,
@@ -666,6 +688,9 @@ async def generate_episode_design_stream(
         for i, chunk_text in enumerate(chunks):
             chunk_start = time.time()
             logging.info(f"SSE chunk {i+1}/{total_chunks}: '{chunk_text[:50]}...'")
+
+            # Seed déterministe dérivé du prompt instruct → même voix sur tous les chunks
+            set_voice_seed(instruct)
 
             # Run blocking GPU inference in thread pool to not block event loop
             loop = asyncio.get_event_loop()
