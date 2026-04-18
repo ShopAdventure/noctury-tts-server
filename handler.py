@@ -350,9 +350,10 @@ def handle_generate_episode_design(job_input: dict) -> dict:
 
         else:
             # Chunks 2+ : VoiceClone pour cohérence de ton
-            if voice_clone_prompt is not None:
+            # generate_voice_clone est Base-only — utiliser base_model
+            if voice_clone_prompt is not None and base_model is not None:
                 torch.manual_seed(42)
-                wavs, chunk_sr = voice_design_model.generate_voice_clone(
+                wavs, chunk_sr = base_model.generate_voice_clone(
                     text=chunk_text,
                     language=language,
                     voice_clone_prompt=voice_clone_prompt,
