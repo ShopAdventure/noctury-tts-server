@@ -34,8 +34,27 @@ echo "=== Models ready ==="
 SERVER_PORT=${PORT:-8000}
 echo "Server port: $SERVER_PORT"
 
-# Start the FastAPI server with uvicorn in the background
-python3 -m uvicorn server:app --host 0.0.0.0 --port $SERVER_PORT --workers 1 &
+# ─── Mode dual : FastAPI (routes courtes) + RunPod Jobs handler (générations longues) ───
+# RUNPOD_JOBS_MODE=1 → démarre uniquement le Jobs handler (sans FastAPI)
+# RUNPOD_JOBS_MODE=0 ou absent → mode normal FastAPI uniquement
+# RUNPOD_DUAL_MODE=1 → démarre les deux en parallèle
 
-# Keep container running for RunPod web terminal access
-sleep infinity
+if [ "${RUNPOD_JOBS_MODE}" = "1" ]; then
+    echo "=== Mode RunPod Jobs Handler ==="
+    echo "Démarrage du handler asynchrone (sans timeout de proxy)..."
+    python3 /app/server/handler.py
+elif [ "${RUNPOD_DUAL_MODE}" = "1" ]; then
+    echo "=== Mode Dual : FastAPI + RunPod Jobs Handler ==="
+    # Démarrer FastAPI en arrière-plan
+    python3 -m uvicorn server:app --host 0.0.0.0 --port $SERVER_PORT --workers 1 &
+    FASTAPI_PID=$!
+    echo "FastAPI démarré (PID $FASTAPI_PID) sur port $SERVER_PORT"
+    # Démarrer le Jobs handler en avant-plan
+    python3 /app/server/handler.py
+else
+    echo "=== Mode FastAPI standard ==="
+    # Start the FastAPI server with uvicorn in the background
+    python3 -m uvicorn server:app --host 0.0.0.0 --port $SERVER_PORT --workers 1 &
+    # Keep container running for RunPod web terminal access
+    sleep infinity
+fi
