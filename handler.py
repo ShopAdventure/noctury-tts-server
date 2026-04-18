@@ -12,12 +12,16 @@ Utilisation côté client :
       "text": "...",
       "instruct": "...",
       "language": "French",
-      "chunk_max_chars": 1600
+      "chunk_max_chars": 800
     }
   }
 
   GET https://api.runpod.ai/v2/{endpoint_id}/status/{job_id}
-  → {"status": "COMPLETED", "output": {"audio_b64": "...", "duration": 360.5}}
+  → {"status": "COMPLETED", "output": {"audio_url": "https://...", "duration": 360.5}}
+
+Stratégie cohérence de voix :
+  - Chunk 1 : generate_voice_design (instruct texte) → extrait 3s de référence
+  - Chunks 2+ : generate_voice_clone (voice_clone_prompt) → voix identique garantie
 """
 
 import os
@@ -44,6 +48,7 @@ R2_ACCESS_KEY_ID = os.getenv("R2_ACCESS_KEY_ID", "")
 R2_SECRET_ACCESS_KEY = os.getenv("R2_SECRET_ACCESS_KEY", "")
 R2_BUCKET = os.getenv("R2_BUCKET", "")
 R2_PUBLIC_URL = os.getenv("R2_PUBLIC_URL", "").rstrip("/")
+
 
 def upload_audio_to_r2(audio_data: np.ndarray, sample_rate: int, prefix: str = "jobs") -> str:
     """Convertit l'audio en MP3 et l'uploade sur R2. Retourne l'URL publique."""
@@ -83,13 +88,17 @@ def upload_audio_to_r2(audio_data: np.ndarray, sample_rate: int, prefix: str = "
     return url
 
 
+# ─── Paramètres de génération ─────────────────────────────────────────────────
 MAX_NEW_TOKENS = int(os.getenv("MAX_NEW_TOKENS", "4096"))
-CHUNK_MAX_CHARS = int(os.getenv("CHUNK_MAX_CHARS", "1600"))
+# 800 chars comme server.py — meilleure qualité et plus rapide par chunk
+CHUNK_MAX_CHARS = int(os.getenv("CHUNK_MAX_CHARS", "800"))
 CROSSFADE_MS = int(os.getenv("CROSSFADE_MS", "200"))
 VD_TEMPERATURE = float(os.getenv("VD_TEMPERATURE", "0.7"))
 VD_TOP_K = int(os.getenv("VD_TOP_K", "30"))
 VD_TOP_P = float(os.getenv("VD_TOP_P", "0.85"))
 VD_REPETITION_PENALTY = float(os.getenv("VD_REPETITION_PENALTY", "1.1"))
+# Durée de l'extrait de référence pour le voice cloning inter-chunks (en secondes)
+VOICE_REF_DURATION_S = float(os.getenv("VOICE_REF_DURATION_S", "5.0"))
 
 VOLUME_MODELS = "/runpod-volume/models"
 HF_HOME = os.getenv("HF_HOME", "/root/.cache/huggingface")
@@ -160,7 +169,7 @@ def enrich_french_instruct(instruct: str) -> str:
         return instruct + suffix
 
 
-def split_text_into_chunks(text: str, max_chars: int = 1600) -> list:
+def split_text_into_chunks(text: str, max_chars: int = 800) -> list:
     """Découpe le texte en chunks respectant les limites de phrases."""
     import re
     sentences = re.split(r'(?<=[.!?…])\s+', text.strip())
@@ -228,10 +237,42 @@ def wav_to_base64(audio_data: np.ndarray, sample_rate: int) -> str:
     return base64.b64encode(buf.read()).decode("utf-8")
 
 
+def extract_voice_reference(audio_data: np.ndarray, sample_rate: int, duration_s: float = 5.0) -> np.ndarray:
+    """Extrait les N premières secondes d'audio comme référence de voix."""
+    n_samples = int(sample_rate * duration_s)
+    return audio_data[:n_samples]
+
+
+def transcribe_audio(audio_data: np.ndarray, sample_rate: int) -> str:
+    """Transcrit l'audio en texte pour le voice cloning (utilise whisper si disponible)."""
+    try:
+        import whisper
+        import soundfile as sf
+        import tempfile
+        # Sauvegarder en WAV temporaire
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
+            sf.write(f.name, audio_data, sample_rate)
+            tmp_path = f.name
+        whisper_model = whisper.load_model("base", device=device)
+        result = whisper_model.transcribe(tmp_path, language="fr")
+        os.unlink(tmp_path)
+        return result.get("text", "").strip()
+    except Exception as e:
+        logger.warning(f"[Handler] Transcription échouée: {e} — utilisation d'un texte vide")
+        return ""
+
+
 # ─── Actions ──────────────────────────────────────────────────────────────────
 
 def handle_generate_episode_design(job_input: dict) -> dict:
-    """Génère un épisode complet avec VoiceDesign sans limite de durée."""
+    """
+    Génère un épisode complet avec VoiceDesign sans limite de durée.
+
+    Stratégie cohérence de voix :
+    - Chunk 1 : generate_voice_design (instruct texte)
+    - Extrait 5s de référence depuis le chunk 1
+    - Chunks 2+ : generate_voice_clone avec voice_clone_prompt → voix identique
+    """
     text = job_input.get("text", "")
     instruct = job_input.get("instruct", "")
     language = job_input.get("language", DEFAULT_LANGUAGE)
@@ -251,28 +292,70 @@ def handle_generate_episode_design(job_input: dict) -> dict:
     audio_chunks = []
     sample_rate = None
     total_start = time.time()
+    voice_clone_prompt = None  # Sera créé après le chunk 1
 
     for i, chunk_text in enumerate(chunks):
         chunk_start = time.time()
         logger.info(f"[Jobs] Chunk {i+1}/{len(chunks)}: '{chunk_text[:60]}...'")
 
-        set_voice_seed(enriched_instruct)
-        wavs, chunk_sr = voice_design_model.generate_voice_design(
-            text=chunk_text,
-            language=language,
-            instruct=enriched_instruct,
-            max_new_tokens=MAX_NEW_TOKENS,
-            temperature=VD_TEMPERATURE,
-            top_k=VD_TOP_K,
-            top_p=VD_TOP_P,
-            repetition_penalty=VD_REPETITION_PENALTY,
-        )
-
-        if sample_rate is None:
+        if i == 0:
+            # Chunk 1 : VoiceDesign depuis le prompt instruct
+            set_voice_seed(enriched_instruct)
+            wavs, chunk_sr = voice_design_model.generate_voice_design(
+                text=chunk_text,
+                language=language,
+                instruct=enriched_instruct,
+                max_new_tokens=MAX_NEW_TOKENS,
+                temperature=VD_TEMPERATURE,
+                top_k=VD_TOP_K,
+                top_p=VD_TOP_P,
+                repetition_penalty=VD_REPETITION_PENALTY,
+            )
+            chunk_audio = wavs[0]
             sample_rate = chunk_sr
 
-        audio_chunks.append(wavs[0])
-        chunk_duration = len(wavs[0]) / chunk_sr
+            # Créer le voice_clone_prompt depuis les 5 premières secondes du chunk 1
+            try:
+                ref_audio = extract_voice_reference(chunk_audio, chunk_sr, VOICE_REF_DURATION_S)
+                ref_text = transcribe_audio(ref_audio, chunk_sr)
+                logger.info(f"[Jobs] Référence vocale extraite ({VOICE_REF_DURATION_S}s) | transcription: '{ref_text[:60]}'")
+                voice_clone_prompt = voice_design_model.create_voice_clone_prompt(
+                    ref_audio=(ref_audio, chunk_sr),
+                    ref_text=ref_text,
+                )
+                logger.info("[Jobs] voice_clone_prompt créé — chunks suivants en mode clone")
+            except Exception as e:
+                logger.warning(f"[Jobs] Impossible de créer voice_clone_prompt: {e} — fallback VoiceDesign pour tous les chunks")
+                voice_clone_prompt = None
+
+        else:
+            # Chunks 2+ : VoiceClone pour cohérence de ton
+            if voice_clone_prompt is not None:
+                torch.manual_seed(42)
+                wavs, chunk_sr = voice_design_model.generate_voice_clone(
+                    text=chunk_text,
+                    language=language,
+                    voice_clone_prompt=voice_clone_prompt,
+                    max_new_tokens=MAX_NEW_TOKENS,
+                )
+                chunk_audio = wavs[0]
+            else:
+                # Fallback : VoiceDesign avec seed fixe
+                set_voice_seed(enriched_instruct)
+                wavs, chunk_sr = voice_design_model.generate_voice_design(
+                    text=chunk_text,
+                    language=language,
+                    instruct=enriched_instruct,
+                    max_new_tokens=MAX_NEW_TOKENS,
+                    temperature=VD_TEMPERATURE,
+                    top_k=VD_TOP_K,
+                    top_p=VD_TOP_P,
+                    repetition_penalty=VD_REPETITION_PENALTY,
+                )
+                chunk_audio = wavs[0]
+
+        audio_chunks.append(chunk_audio)
+        chunk_duration = len(chunk_audio) / chunk_sr
         logger.info(f"[Jobs] Chunk {i+1} terminé en {time.time()-chunk_start:.1f}s ({chunk_duration:.1f}s audio)")
 
     final_audio = assemble_chunks_audio(audio_chunks, sample_rate, CROSSFADE_MS)
@@ -293,6 +376,7 @@ def handle_generate_episode_design(job_input: dict) -> dict:
                 "chunks": len(chunks),
                 "elapsed": round(total_elapsed, 2),
                 "instruct_enriched": enriched_instruct,
+                "voice_clone_used": voice_clone_prompt is not None,
             }
         except Exception as e:
             logger.error(f"[R2] Erreur upload : {e} — fallback base64")
@@ -307,10 +391,11 @@ def handle_generate_episode_design(job_input: dict) -> dict:
             "chunks": len(chunks),
             "elapsed": round(total_elapsed, 2),
             "instruct_enriched": enriched_instruct,
+            "voice_clone_used": voice_clone_prompt is not None,
         }
     else:
         return {
-            "error": f"Audio trop volumineux ({audio_size_mb:.1f} MB) et R2 non configuré — configurez R2_ENDPOINT, R2_ACCESS_KEY_ID, R2_BUCKET, R2_PUBLIC_URL",
+            "error": f"Audio trop volumineux ({audio_size_mb:.1f} MB) et R2 non configuré",
             "duration": round(total_duration, 2),
             "chunks": len(chunks),
             "elapsed": round(total_elapsed, 2),
@@ -349,6 +434,8 @@ def handle_debug() -> dict:
         "volume_path_exists": os.path.isdir("/runpod-volume/models"),
         "candidate_vd_exists": os.path.isdir("/runpod-volume/models/Qwen3-TTS-12Hz-1.7B-VoiceDesign"),
         "python_path": sys.path,
+        "chunk_max_chars": CHUNK_MAX_CHARS,
+        "voice_ref_duration_s": VOICE_REF_DURATION_S,
     }
 
 
@@ -378,12 +465,9 @@ def handler(job: dict) -> dict:
             return {"error": f"Action inconnue : '{action}'. Disponibles : generate_episode_design, health, debug"}
 
     except Exception as e:
-        logger.error(f"[Jobs] Erreur : {e}", exc_info=True)
-        return {"error": str(e)}
+        logger.error(f"[Jobs] Erreur inattendue: {e}", exc_info=True)
+        return {"error": f"{type(e).__name__}: {str(e)}"}
 
 
-# ─── Démarrage ────────────────────────────────────────────────────────────────
-if __name__ == "__main__":
-    import runpod
-    logger.info("[Jobs] Démarrage du worker RunPod Jobs (mode autonome)...")
-    runpod.serverless.start({"handler": handler})
+import runpod
+runpod.serverless.start({"handler": handler})
