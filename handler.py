@@ -1,16 +1,11 @@
 """
-Noctury TTS — RunPod Jobs Handler
-==================================
+Noctury TTS — RunPod Jobs Handler (Autonome)
+=============================================
 Handler asynchrone pour les générations longues (épisodes > 90s).
+Version autonome : charge les modèles directement sans importer server.py.
 
-Architecture :
-  - Le serveur FastAPI (server.py) reste actif pour les routes courtes
-    (health, synthesize_speech, synthesize_speech_design, etc.)
-  - Ce handler est appelé par RunPod via POST /run (asynchrone) ou
-    POST /runsync (synchrone, mais sans timeout de proxy)
-
-Utilisation côté client (Railway) :
-  POST https://{endpoint_id}-{job_id}.proxy.runpod.net/run
+Utilisation côté client :
+  POST https://api.runpod.ai/v2/{endpoint_id}/run
   Body: {
     "input": {
       "action": "generate_episode_design",
@@ -23,11 +18,6 @@ Utilisation côté client (Railway) :
 
   GET https://api.runpod.ai/v2/{endpoint_id}/status/{job_id}
   → {"status": "COMPLETED", "output": {"audio_b64": "...", "duration": 360.5}}
-
-Actions supportées :
-  - generate_episode_design : génération VoiceDesign texte long
-  - generate_episode        : génération Voice Clone texte long
-  - health                  : vérification santé du worker
 """
 
 import os
@@ -35,65 +25,166 @@ import sys
 import time
 import base64
 import io
-import wave
-import logging
 import hashlib
+import logging
 import numpy as np
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+logger = logging.getLogger(__name__)
 
-# ─── Import des modèles depuis server.py ─────────────────────────────────────
-# On importe les modèles déjà chargés en mémoire par server.py pour éviter
-# de les recharger deux fois (économie de VRAM et de temps de démarrage)
-sys.path.insert(0, os.path.dirname(__file__))
+# ─── Configuration ────────────────────────────────────────────────────────────
+DEFAULT_LANGUAGE = os.getenv("DEFAULT_LANGUAGE", "French")
+MAX_NEW_TOKENS = int(os.getenv("MAX_NEW_TOKENS", "4096"))
+CHUNK_MAX_CHARS = int(os.getenv("CHUNK_MAX_CHARS", "1600"))
+CROSSFADE_MS = int(os.getenv("CROSSFADE_MS", "200"))
+VD_TEMPERATURE = float(os.getenv("VD_TEMPERATURE", "0.7"))
+VD_TOP_K = int(os.getenv("VD_TOP_K", "30"))
+VD_TOP_P = float(os.getenv("VD_TOP_P", "0.85"))
+VD_REPETITION_PENALTY = float(os.getenv("VD_REPETITION_PENALTY", "1.1"))
+
+VOLUME_MODELS = "/runpod-volume/models"
+HF_HOME = os.getenv("HF_HOME", "/root/.cache/huggingface")
+
+# ─── Chargement des modèles ───────────────────────────────────────────────────
+logger.info("[Handler] Initialisation des modèles TTS...")
+
+import torch
+device = "cuda" if torch.cuda.is_available() else "cpu"
+logger.info(f"[Handler] Device: {device}")
+
+voice_design_model = None
+MODELS_LOADED = False
 
 try:
-    import torch
-    from server import (
-        voice_design_model,
-        base_model,
-        device,
-        DEFAULT_LANGUAGE,
-        CHUNK_MAX_CHARS,
-        VD_TEMPERATURE,
-        VD_TOP_K,
-        VD_TOP_P,
-        VD_REPETITION_PENALTY,
-        MAX_NEW_TOKENS,
-        split_text_into_chunks,
-        assemble_chunks_audio,
-        enrich_french_instruct,
-        set_voice_seed,
-        get_or_create_voice_cache,
-        generate_speech_with_prompt,
-        resources_dir,
+    import qwen_tts
+
+    # Chemin du modèle VoiceDesign
+    vd_path = None
+    candidate_vd = os.path.join(VOLUME_MODELS, "Qwen3-TTS-12Hz-1.7B-VoiceDesign")
+    if os.path.isdir(candidate_vd):
+        vd_path = candidate_vd
+        logger.info(f"[Handler] VoiceDesign depuis volume: {vd_path}")
+    else:
+        vd_path = "Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign"
+        logger.info(f"[Handler] VoiceDesign depuis HuggingFace: {vd_path}")
+
+    voice_design_model = qwen_tts.VoiceDesign(
+        model_name_or_path=vd_path,
+        device=device,
     )
-    import soundfile as sf
     MODELS_LOADED = True
-    logging.info("Handler: modèles importés depuis server.py avec succès")
+    logger.info("[Handler] Modèle VoiceDesign chargé avec succès")
+
 except Exception as e:
+    logger.error(f"[Handler] Erreur chargement modèle: {e}", exc_info=True)
     MODELS_LOADED = False
-    logging.error(f"Handler: impossible d'importer server.py — {e}")
+
+
+# ─── Helpers ──────────────────────────────────────────────────────────────────
+
+def voice_seed(instruct: str) -> int:
+    """Calcule un seed déterministe depuis le prompt instruct."""
+    return int(hashlib.md5(instruct.encode()).hexdigest(), 16) % (2**31)
+
+
+def set_voice_seed(instruct: str) -> None:
+    """Fixe le seed aléatoire pour la cohérence inter-chunks."""
+    seed = voice_seed(instruct)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+
+def enrich_french_instruct(instruct: str) -> str:
+    """Enrichit le prompt instruct pour forcer l'accent français."""
+    lower = instruct.lower()
+    has_french = any(w in lower for w in ["français", "française", "parisien", "parisienne", "french"])
+
+    if not has_french:
+        prefix = "Locutrice native française, accent parisien pur, prononciation française authentique. "
+        suffix = " Aucun accent anglais, voyelles et consonnes françaises natives."
+        return prefix + instruct + suffix
+    else:
+        suffix = " Prononciation française native, voyelles françaises pures, aucun accent anglais."
+        return instruct + suffix
+
+
+def split_text_into_chunks(text: str, max_chars: int = 1600) -> list:
+    """Découpe le texte en chunks respectant les limites de phrases."""
+    import re
+    sentences = re.split(r'(?<=[.!?…])\s+', text.strip())
+    chunks = []
+    current = ""
+
+    for sentence in sentences:
+        if len(current) + len(sentence) + 1 <= max_chars:
+            current = (current + " " + sentence).strip() if current else sentence
+        else:
+            if current:
+                chunks.append(current)
+            if len(sentence) > max_chars:
+                # Découpe forcée sur les virgules
+                parts = sentence.split(", ")
+                sub = ""
+                for part in parts:
+                    if len(sub) + len(part) + 2 <= max_chars:
+                        sub = (sub + ", " + part).strip(", ") if sub else part
+                    else:
+                        if sub:
+                            chunks.append(sub)
+                        sub = part
+                if sub:
+                    current = sub
+                else:
+                    current = ""
+            else:
+                current = sentence
+
+    if current:
+        chunks.append(current)
+
+    return [c for c in chunks if c.strip()]
+
+
+def assemble_chunks_audio(audio_chunks: list, sample_rate: int, crossfade_ms: int = 200) -> np.ndarray:
+    """Assemble les chunks audio avec crossfade."""
+    if not audio_chunks:
+        return np.array([], dtype=np.float32)
+    if len(audio_chunks) == 1:
+        return audio_chunks[0]
+
+    crossfade_samples = int(sample_rate * crossfade_ms / 1000)
+    result = audio_chunks[0]
+
+    for chunk in audio_chunks[1:]:
+        if crossfade_samples > 0 and len(result) >= crossfade_samples and len(chunk) >= crossfade_samples:
+            fade_out = np.linspace(1.0, 0.0, crossfade_samples)
+            fade_in = np.linspace(0.0, 1.0, crossfade_samples)
+            result[-crossfade_samples:] = result[-crossfade_samples:] * fade_out + chunk[:crossfade_samples] * fade_in
+            result = np.concatenate([result, chunk[crossfade_samples:]])
+        else:
+            result = np.concatenate([result, chunk])
+
+    return result
 
 
 def wav_to_base64(audio_data: np.ndarray, sample_rate: int) -> str:
     """Convertit un array numpy en WAV base64."""
+    import soundfile as sf
     buf = io.BytesIO()
     sf.write(buf, audio_data, sample_rate, format="WAV")
     buf.seek(0)
     return base64.b64encode(buf.read()).decode("utf-8")
 
 
+# ─── Actions ──────────────────────────────────────────────────────────────────
+
 def handle_generate_episode_design(job_input: dict) -> dict:
-    """
-    Génère un épisode complet avec VoiceDesign sans limite de durée.
-    Chunk_max_chars peut être monté jusqu'à ~3000 chars sans timeout
-    car on est en mode Jobs asynchrone.
-    """
+    """Génère un épisode complet avec VoiceDesign sans limite de durée."""
     text = job_input.get("text", "")
     instruct = job_input.get("instruct", "")
     language = job_input.get("language", DEFAULT_LANGUAGE)
-    chunk_max = job_input.get("chunk_max_chars", 1600)  # 2× plus grand qu'en HTTP sync
+    chunk_max = int(job_input.get("chunk_max_chars", CHUNK_MAX_CHARS))
 
     if not text:
         return {"error": "Le champ 'text' est requis"}
@@ -101,10 +192,10 @@ def handle_generate_episode_design(job_input: dict) -> dict:
         return {"error": "Le champ 'instruct' est requis"}
 
     enriched_instruct = enrich_french_instruct(instruct)
-    logging.info(f"[Jobs] generate_episode_design | {len(text)} chars | instruct: {enriched_instruct[:80]}")
+    logger.info(f"[Jobs] generate_episode_design | {len(text)} chars | instruct: {enriched_instruct[:80]}")
 
     chunks = split_text_into_chunks(text, max_chars=chunk_max)
-    logging.info(f"[Jobs] {len(chunks)} chunks de max {chunk_max} chars")
+    logger.info(f"[Jobs] {len(chunks)} chunks de max {chunk_max} chars")
 
     audio_chunks = []
     sample_rate = None
@@ -112,7 +203,7 @@ def handle_generate_episode_design(job_input: dict) -> dict:
 
     for i, chunk_text in enumerate(chunks):
         chunk_start = time.time()
-        logging.info(f"[Jobs] Chunk {i+1}/{len(chunks)}: '{chunk_text[:60]}...'")
+        logger.info(f"[Jobs] Chunk {i+1}/{len(chunks)}: '{chunk_text[:60]}...'")
 
         set_voice_seed(enriched_instruct)
         wavs, chunk_sr = voice_design_model.generate_voice_design(
@@ -131,13 +222,13 @@ def handle_generate_episode_design(job_input: dict) -> dict:
 
         audio_chunks.append(wavs[0])
         chunk_duration = len(wavs[0]) / chunk_sr
-        logging.info(f"[Jobs] Chunk {i+1} terminé en {time.time()-chunk_start:.1f}s ({chunk_duration:.1f}s audio)")
+        logger.info(f"[Jobs] Chunk {i+1} terminé en {time.time()-chunk_start:.1f}s ({chunk_duration:.1f}s audio)")
 
-    final_audio = assemble_chunks_audio(audio_chunks, sample_rate)
+    final_audio = assemble_chunks_audio(audio_chunks, sample_rate, CROSSFADE_MS)
     total_duration = len(final_audio) / sample_rate
     total_elapsed = time.time() - total_start
 
-    logging.info(f"[Jobs] Assemblage terminé : {total_duration:.1f}s audio en {total_elapsed:.1f}s")
+    logger.info(f"[Jobs] Assemblage terminé : {total_duration:.1f}s audio en {total_elapsed:.1f}s")
 
     audio_b64 = wav_to_base64(final_audio, sample_rate)
 
@@ -151,111 +242,47 @@ def handle_generate_episode_design(job_input: dict) -> dict:
     }
 
 
-def handle_generate_episode(job_input: dict) -> dict:
-    """
-    Génère un épisode complet avec Voice Clone (voix de référence) sans limite de durée.
-    """
-    text = job_input.get("text", "")
-    voice = job_input.get("voice", "")
-    language = job_input.get("language", DEFAULT_LANGUAGE)
-    speed = job_input.get("speed", 0.92)
-    chunk_max = job_input.get("chunk_max_chars", 1600)
-
-    if not text:
-        return {"error": "Le champ 'text' est requis"}
-    if not voice:
-        return {"error": "Le champ 'voice' est requis"}
-
-    logging.info(f"[Jobs] generate_episode | voice={voice} | {len(text)} chars")
-
-    # Trouver le fichier voix
-    matching_files = [
-        f for f in os.listdir(resources_dir)
-        if f.startswith(voice) and f.lower().endswith(".wav")
-    ]
-    if not matching_files:
-        return {"error": f"Voix '{voice}' introuvable dans {resources_dir}"}
-
-    reference_file = f"{resources_dir}/{matching_files[0]}"
-    cache_data = get_or_create_voice_cache(voice, reference_file)
-
-    chunks = split_text_into_chunks(text, max_chars=chunk_max)
-    logging.info(f"[Jobs] {len(chunks)} chunks")
-
-    audio_chunks = []
-    sample_rate = None
-    total_start = time.time()
-
-    for i, chunk_text in enumerate(chunks):
-        chunk_start = time.time()
-        audio_data, chunk_sr = generate_speech_with_prompt(
-            chunk_text, cache_data["prompt"], speed=speed, language=language
-        )
-        if sample_rate is None:
-            sample_rate = chunk_sr
-        audio_chunks.append(audio_data)
-        logging.info(f"[Jobs] Chunk {i+1}/{len(chunks)} en {time.time()-chunk_start:.1f}s")
-
-    final_audio = assemble_chunks_audio(audio_chunks, sample_rate)
-    total_duration = len(final_audio) / sample_rate
-    total_elapsed = time.time() - total_start
-
-    audio_b64 = wav_to_base64(final_audio, sample_rate)
-
+def handle_health() -> dict:
+    """Retourne l'état de santé du worker."""
     return {
-        "audio_b64": audio_b64,
-        "duration": round(total_duration, 2),
-        "sample_rate": sample_rate,
-        "chunks": len(chunks),
-        "elapsed": round(total_elapsed, 2),
+        "status": "ok",
+        "device": device,
+        "cuda_available": torch.cuda.is_available(),
+        "models_loaded": MODELS_LOADED,
+        "gpu_name": torch.cuda.get_device_name(0) if torch.cuda.is_available() else "N/A",
     }
 
+
+# ─── Point d'entrée RunPod Jobs ───────────────────────────────────────────────
 
 def handler(job: dict) -> dict:
     """
     Point d'entrée principal du RunPod Jobs handler.
-
-    RunPod appelle cette fonction avec :
-    {
-      "id": "job-uuid",
-      "input": {
-        "action": "generate_episode_design",
-        ...
-      }
-    }
-
-    La fonction retourne un dict qui sera stocké dans output du job.
+    RunPod appelle cette fonction avec {"id": "...", "input": {...}}
     """
     job_input = job.get("input", {})
     action = job_input.get("action", "generate_episode_design")
 
-    logging.info(f"[Jobs] Received job | action={action} | id={job.get('id', 'unknown')}")
+    logger.info(f"[Jobs] Received job | action={action} | id={job.get('id', 'unknown')}")
 
     if not MODELS_LOADED:
-        return {"error": "Modèles non chargés — le serveur FastAPI n'est pas encore prêt"}
+        return {"error": "Modèles non chargés — erreur au démarrage du worker"}
 
     try:
         if action == "generate_episode_design":
             return handle_generate_episode_design(job_input)
-        elif action == "generate_episode":
-            return handle_generate_episode(job_input)
         elif action == "health":
-            return {
-                "status": "ok",
-                "device": str(device),
-                "cuda_available": torch.cuda.is_available(),
-                "models_loaded": MODELS_LOADED,
-            }
+            return handle_health()
         else:
-            return {"error": f"Action inconnue : '{action}'. Actions disponibles : generate_episode_design, generate_episode, health"}
+            return {"error": f"Action inconnue : '{action}'. Disponibles : generate_episode_design, health"}
 
     except Exception as e:
-        logging.error(f"[Jobs] Erreur dans handler : {e}", exc_info=True)
+        logger.error(f"[Jobs] Erreur : {e}", exc_info=True)
         return {"error": str(e)}
 
 
-# ─── Démarrage du worker RunPod Jobs ─────────────────────────────────────────
+# ─── Démarrage ────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     import runpod
-    logging.info("[Jobs] Démarrage du worker RunPod Jobs...")
+    logger.info("[Jobs] Démarrage du worker RunPod Jobs (mode autonome)...")
     runpod.serverless.start({"handler": handler})
