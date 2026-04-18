@@ -13,7 +13,10 @@ import soundfile as sf
 import io
 import magic
 import logging
-from typing import Optional, List
+import json
+import base64
+import asyncio
+from typing import Optional, List, AsyncGenerator
 from fastapi import FastAPI, UploadFile, File, HTTPException, Form, Header, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, JSONResponse
@@ -27,7 +30,7 @@ API_KEY = os.environ.get("NOCTURY_TTS_API_KEY", "")
 MAX_NEW_TOKENS = int(os.environ.get("MAX_NEW_TOKENS", "4096"))
 DEFAULT_LANGUAGE = os.environ.get("DEFAULT_LANGUAGE", "French")
 DEFAULT_SPEED = float(os.environ.get("DEFAULT_SPEED", "0.92"))
-CHUNK_MAX_CHARS = int(os.environ.get("CHUNK_MAX_CHARS", "400"))
+CHUNK_MAX_CHARS = int(os.environ.get("CHUNK_MAX_CHARS", "800"))
 CROSSFADE_MS = int(os.environ.get("CROSSFADE_MS", "200"))
 
 app = FastAPI(
@@ -625,6 +628,94 @@ async def generate_episode_design(
     except Exception as e:
         logging.error(f"Error in generate_episode_design: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/generate_episode_design_stream/")
+async def generate_episode_design_stream(
+    text: str,
+    instruct: str,
+    speed: Optional[float] = None,
+    language: Optional[str] = None,
+    chunk_max_chars: Optional[int] = None,
+    x_noctury_key: Optional[str] = Header(None),
+):
+    """
+    Streaming SSE endpoint for long-text VoiceDesign generation.
+    Sends each audio chunk as base64 via Server-Sent Events as it is generated,
+    avoiding RunPod proxy timeouts on long texts.
+
+    Client receives events:
+      data: {"chunk": 1, "total": 3, "audio_b64": "...", "done": false}
+      data: {"chunk": 3, "total": 3, "audio_b64": "...", "done": true, "duration": 45.2}
+
+    The client assembles the WAV chunks in order.
+    """
+    verify_api_key(x_noctury_key)
+
+    lang = language or DEFAULT_LANGUAGE
+    chunk_max = chunk_max_chars or CHUNK_MAX_CHARS
+
+    chunks = split_text_into_chunks(text, max_chars=chunk_max)
+    total_chunks = len(chunks)
+    total_duration = 0.0
+
+    logging.info(f"SSE stream: {total_chunks} chunks | instruct={instruct[:60]}")
+
+    async def event_generator() -> AsyncGenerator[str, None]:
+        nonlocal total_duration
+        for i, chunk_text in enumerate(chunks):
+            chunk_start = time.time()
+            logging.info(f"SSE chunk {i+1}/{total_chunks}: '{chunk_text[:50]}...'")
+
+            # Run blocking GPU inference in thread pool to not block event loop
+            loop = asyncio.get_event_loop()
+            wavs, sr = await loop.run_in_executor(
+                None,
+                lambda ct=chunk_text: voice_design_model.generate_voice_design(
+                    text=ct,
+                    language=lang,
+                    instruct=instruct,
+                    max_new_tokens=MAX_NEW_TOKENS,
+                )
+            )
+
+            audio_data = wavs[0]
+            chunk_duration = len(audio_data) / sr
+            total_duration += chunk_duration
+
+            # Encode chunk as WAV bytes → base64
+            buf = io.BytesIO()
+            sf.write(buf, audio_data, sr, format="WAV")
+            buf.seek(0)
+            audio_b64 = base64.b64encode(buf.read()).decode("utf-8")
+
+            is_done = (i == total_chunks - 1)
+            payload = {
+                "chunk": i + 1,
+                "total": total_chunks,
+                "audio_b64": audio_b64,
+                "sample_rate": sr,
+                "chunk_duration": round(chunk_duration, 2),
+                "done": is_done,
+            }
+            if is_done:
+                payload["total_duration"] = round(total_duration, 2)
+
+            logging.info(f"SSE chunk {i+1} done in {time.time()-chunk_start:.1f}s ({chunk_duration:.1f}s audio)")
+            yield f"data: {json.dumps(payload)}\n\n"
+
+        # Final keepalive to signal end
+        yield "data: {\"event\": \"end\"}\n\n"
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+            "Access-Control-Allow-Origin": "*",
+        },
+    )
 
 
 @app.post("/upload_audio/")
