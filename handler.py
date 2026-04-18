@@ -248,11 +248,35 @@ def handle_generate_episode_design(job_input: dict) -> dict:
 def handle_health() -> dict:
     """Retourne l'état de santé du worker."""
     return {
-        "status": "ok",
+        "status": "ok" if MODELS_LOADED else "error",
         "device": device,
         "cuda_available": torch.cuda.is_available(),
         "models_loaded": MODELS_LOADED,
+        "models_error": MODELS_ERROR,
         "gpu_name": torch.cuda.get_device_name(0) if torch.cuda.is_available() else "N/A",
+    }
+
+
+def handle_debug() -> dict:
+    """Retourne des informations de débogage sur l'environnement."""
+    import subprocess
+    volume_ls = subprocess.run(
+        ["ls", "-la", "/runpod-volume/models/"],
+        capture_output=True, text=True
+    )
+    pip_qwen = subprocess.run(
+        ["pip3", "show", "qwen-tts"],
+        capture_output=True, text=True
+    )
+    return {
+        "models_loaded": MODELS_LOADED,
+        "models_error": MODELS_ERROR,
+        "volume_ls": volume_ls.stdout or volume_ls.stderr,
+        "qwen_tts_installed": pip_qwen.stdout or pip_qwen.stderr,
+        "env_model_vd": os.getenv("NOCTURY_MODEL_VOICEDESIGN", "non défini"),
+        "volume_path_exists": os.path.isdir("/runpod-volume/models"),
+        "candidate_vd_exists": os.path.isdir("/runpod-volume/models/Qwen3-TTS-12Hz-1.7B-VoiceDesign"),
+        "python_path": sys.path,
     }
 
 
@@ -276,8 +300,10 @@ def handler(job: dict) -> dict:
             return handle_generate_episode_design(job_input)
         elif action == "health":
             return handle_health()
+        elif action == "debug":
+            return handle_debug()
         else:
-            return {"error": f"Action inconnue : '{action}'. Disponibles : generate_episode_design, health"}
+            return {"error": f"Action inconnue : '{action}'. Disponibles : generate_episode_design, health, debug"}
 
     except Exception as e:
         logger.error(f"[Jobs] Erreur : {e}", exc_info=True)
