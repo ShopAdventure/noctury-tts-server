@@ -54,6 +54,7 @@ logger.info(f"[Handler] Device: {device}")
 
 voice_design_model = None
 MODELS_LOADED = False
+MODELS_ERROR = None
 
 try:
     import qwen_tts
@@ -67,6 +68,7 @@ try:
     else:
         vd_path = "Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign"
         logger.info(f"[Handler] VoiceDesign depuis HuggingFace: {vd_path}")
+        logger.warning(f"[Handler] Volume non trouvé à {candidate_vd} — téléchargement depuis HuggingFace")
 
     voice_design_model = qwen_tts.VoiceDesign(
         model_name_or_path=vd_path,
@@ -76,7 +78,8 @@ try:
     logger.info("[Handler] Modèle VoiceDesign chargé avec succès")
 
 except Exception as e:
-    logger.error(f"[Handler] Erreur chargement modèle: {e}", exc_info=True)
+    MODELS_ERROR = f"{type(e).__name__}: {e}"
+    logger.error(f"[Handler] Erreur chargement modèle: {MODELS_ERROR}", exc_info=True)
     MODELS_LOADED = False
 
 
@@ -266,7 +269,7 @@ def handler(job: dict) -> dict:
     logger.info(f"[Jobs] Received job | action={action} | id={job.get('id', 'unknown')}")
 
     if not MODELS_LOADED:
-        return {"error": "Modèles non chargés — erreur au démarrage du worker"}
+        return {"error": f"Modèles non chargés — {MODELS_ERROR or 'erreur inconnue au démarrage du worker'}"}
 
     try:
         if action == "generate_episode_design":
