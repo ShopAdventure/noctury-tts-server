@@ -111,6 +111,7 @@ device = "cuda" if torch.cuda.is_available() else "cpu"
 logger.info(f"[Handler] Device: {device}")
 
 voice_design_model = None
+base_model = None  # Modèle Base pour create_voice_clone_prompt
 MODELS_LOADED = False
 MODELS_ERROR = None
 
@@ -133,6 +134,22 @@ try:
     )
     MODELS_LOADED = True
     logger.info("[Handler] Modèle VoiceDesign chargé avec succès")
+
+    # Charger le modèle Base pour create_voice_clone_prompt (méthode Base-only)
+    candidate_base = os.path.join(VOLUME_MODELS, "Qwen3-TTS-12Hz-1.7B-Base")
+    if os.path.isdir(candidate_base):
+        base_path = candidate_base
+        logger.info(f"[Handler] Base depuis volume: {base_path}")
+    else:
+        base_path = "Qwen/Qwen3-TTS-12Hz-1.7B-Base"
+        logger.warning(f"[Handler] Base non trouvé à {candidate_base} — utilisation de: {base_path}")
+
+    base_model = Qwen3TTSModel.from_pretrained(
+        base_path,
+        device_map=device,
+        dtype=torch.bfloat16,
+    )
+    logger.info("[Handler] Modèle Base chargé avec succès (pour voice cloning)")
 
 except Exception as e:
     MODELS_ERROR = f"{type(e).__name__}: {e}"
@@ -319,9 +336,12 @@ def handle_generate_episode_design(job_input: dict) -> dict:
                 ref_audio = extract_voice_reference(chunk_audio, chunk_sr, VOICE_REF_DURATION_S)
                 ref_text = transcribe_audio(ref_audio, chunk_sr)
                 logger.info(f"[Jobs] Référence vocale extraite ({VOICE_REF_DURATION_S}s) | transcription: '{ref_text[:60]}'")
-                voice_clone_prompt = voice_design_model.create_voice_clone_prompt(
+                # create_voice_clone_prompt est Base-only — utiliser base_model
+                clone_model = base_model if base_model is not None else voice_design_model
+                voice_clone_prompt = clone_model.create_voice_clone_prompt(
                     ref_audio=(ref_audio, chunk_sr),
-                    ref_text=ref_text,
+                    ref_text=ref_text if ref_text else None,
+                    x_vector_only_mode=(ref_text == ""),
                 )
                 logger.info("[Jobs] voice_clone_prompt créé — chunks suivants en mode clone")
             except Exception as e:
