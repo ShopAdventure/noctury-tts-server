@@ -33,6 +33,14 @@ DEFAULT_SPEED = float(os.environ.get("DEFAULT_SPEED", "0.92"))
 CHUNK_MAX_CHARS = int(os.environ.get("CHUNK_MAX_CHARS", "800"))
 CROSSFADE_MS = int(os.environ.get("CROSSFADE_MS", "200"))
 
+# Paramètres de génération VoiceDesign optimisés pour éviter l'accent anglais parasite
+# temperature basse = moins d'aléatoire = voix plus stable et accent plus net
+# repetition_penalty plus fort = évite les tokens anglais répétés
+VD_TEMPERATURE = float(os.environ.get("VD_TEMPERATURE", "0.7"))
+VD_TOP_K = int(os.environ.get("VD_TOP_K", "30"))
+VD_TOP_P = float(os.environ.get("VD_TOP_P", "0.85"))
+VD_REPETITION_PENALTY = float(os.environ.get("VD_REPETITION_PENALTY", "1.1"))
+
 app = FastAPI(
     title="Noctury TTS Server",
     description="Serveur TTS auto-hébergé pour Noctury, basé sur Qwen3-TTS",
@@ -427,6 +435,42 @@ def set_voice_seed(instruct: str) -> None:
     logging.info(f"Voice seed set to {seed} (from instruct hash)")
 
 
+def enrich_french_instruct(instruct: str) -> str:
+    """
+    Enrichit le prompt instruct pour forcer un accent français natif.
+
+    Le modèle Qwen3-TTS-VoiceDesign a un biais vers l'anglais (entraînement
+    majoritairement en anglais). Pour contrer cela, on injecte des marqueurs
+    explicites de langue et d'accent français dans le prompt.
+
+    Stratégie :
+    1. Si le prompt ne mentionne pas déjà 'français' ou 'french', on préfixe
+       avec des marqueurs forts de langue française native.
+    2. On ajoute également un suffixe de renforcement phonologique.
+    """
+    lower = instruct.lower()
+    already_french = any(kw in lower for kw in [
+        "français", "french", "parisien", "accent français", "langue française",
+        "native french", "locutrice native", "locuteur natif"
+    ])
+
+    if already_french:
+        # Renforcer avec suffixe phonologique si pas déjà présent
+        if "phonologie" not in lower and "prononc" not in lower:
+            instruct = instruct.rstrip(". ") + \
+                ". Prononciation française native, voyelles françaises pures, aucun accent anglais."
+    else:
+        # Préfixer avec marqueurs forts de langue française
+        instruct = (
+            "Locutrice native française, accent parisien pur, prononciation française authentique. "
+            + instruct
+        )
+        instruct = instruct.rstrip(". ") + \
+            ". Aucun accent anglais, voyelles et consonnes françaises natives."
+
+    return instruct
+
+
 def assemble_chunks_audio(audio_chunks: List[np.ndarray], sr: int) -> np.ndarray:
     """
     Assemble multiple audio chunks into a single audio with crossfade.
@@ -541,14 +585,20 @@ async def synthesize_speech_design(
         lang = language or DEFAULT_LANGUAGE
         spd = speed or DEFAULT_SPEED
 
-        logging.info(f"VoiceDesign generation | lang={lang} | instruct={instruct[:80]}")
+        # Enrichir le prompt pour forcer l'accent français natif
+        enriched_instruct = enrich_french_instruct(instruct)
+        logging.info(f"VoiceDesign generation | lang={lang} | instruct={enriched_instruct[:120]}")
 
-        set_voice_seed(instruct)
+        set_voice_seed(enriched_instruct)
         wavs, sr = voice_design_model.generate_voice_design(
             text=text,
             language=lang,
-            instruct=instruct,
+            instruct=enriched_instruct,
             max_new_tokens=MAX_NEW_TOKENS,
+            temperature=VD_TEMPERATURE,
+            top_k=VD_TOP_K,
+            top_p=VD_TOP_P,
+            repetition_penalty=VD_REPETITION_PENALTY,
         )
 
         audio_data = wavs[0]
@@ -604,16 +654,24 @@ async def generate_episode_design(
         audio_chunks = []
         sr = None
 
+        # Enrichir le prompt une seule fois pour tous les chunks
+        enriched_instruct = enrich_french_instruct(request.instruct)
+        logging.info(f"Enriched instruct: {enriched_instruct[:120]}")
+
         for i, chunk_text in enumerate(chunks):
             chunk_start = time.time()
             logging.info(f"Chunk {i+1}/{len(chunks)}: '{chunk_text[:60]}...'")
 
-            set_voice_seed(request.instruct)
+            set_voice_seed(enriched_instruct)
             wavs, chunk_sr = voice_design_model.generate_voice_design(
                 text=chunk_text,
                 language=lang,
-                instruct=request.instruct,
+                instruct=enriched_instruct,
                 max_new_tokens=MAX_NEW_TOKENS,
+                temperature=VD_TEMPERATURE,
+                top_k=VD_TOP_K,
+                top_p=VD_TOP_P,
+                repetition_penalty=VD_REPETITION_PENALTY,
             )
 
             if sr is None:
@@ -677,11 +735,14 @@ async def generate_episode_design_stream(
     lang = language or DEFAULT_LANGUAGE
     chunk_max = chunk_max_chars or CHUNK_MAX_CHARS
 
+    # Enrichir le prompt une seule fois pour tous les chunks SSE
+    enriched_instruct = enrich_french_instruct(instruct)
+
     chunks = split_text_into_chunks(text, max_chars=chunk_max)
     total_chunks = len(chunks)
     total_duration = 0.0
 
-    logging.info(f"SSE stream: {total_chunks} chunks | instruct={instruct[:60]}")
+    logging.info(f"SSE stream: {total_chunks} chunks | instruct={enriched_instruct[:80]}")
 
     async def event_generator() -> AsyncGenerator[str, None]:
         nonlocal total_duration
@@ -689,8 +750,8 @@ async def generate_episode_design_stream(
             chunk_start = time.time()
             logging.info(f"SSE chunk {i+1}/{total_chunks}: '{chunk_text[:50]}...'")
 
-            # Seed déterministe dérivé du prompt instruct → même voix sur tous les chunks
-            set_voice_seed(instruct)
+            # Seed déterministe dérivé du prompt enrichi → même voix sur tous les chunks
+            set_voice_seed(enriched_instruct)
 
             # Run blocking GPU inference in thread pool to not block event loop
             loop = asyncio.get_event_loop()
@@ -699,8 +760,12 @@ async def generate_episode_design_stream(
                 lambda ct=chunk_text: voice_design_model.generate_voice_design(
                     text=ct,
                     language=lang,
-                    instruct=instruct,
+                    instruct=enriched_instruct,
                     max_new_tokens=MAX_NEW_TOKENS,
+                    temperature=VD_TEMPERATURE,
+                    top_k=VD_TOP_K,
+                    top_p=VD_TOP_P,
+                    repetition_penalty=VD_REPETITION_PENALTY,
                 )
             )
 
