@@ -24,7 +24,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && apt-get clean
 
 # CUDA compat
-RUN ldconfig /usr/local/cuda-12.1/compat/
+RUN ldconfig /usr/local/cuda-12.1/compat/ 2>/dev/null || true
 
 # Upgrade pip
 RUN pip3 install --no-cache-dir --upgrade pip setuptools wheel
@@ -55,7 +55,7 @@ ENV VD_TOP_K=30
 ENV VD_TOP_P=0.85
 ENV VD_REPETITION_PENALTY=1.1
 
-# HuggingFace cache directory (models downloaded at first startup)
+# HuggingFace cache directory
 ENV HF_HOME=/root/.cache/huggingface
 
 # Create necessary directories
@@ -63,32 +63,13 @@ RUN mkdir -p /app/server/outputs /app/server/resources
 
 # Copy handler and dependencies
 COPY handler.py /app/server/
-COPY download_models.py /app/server/
+COPY start_jobs.sh /app/server/start_jobs.sh
+RUN chmod +x /app/server/start_jobs.sh
 
-# Copy voice reference files
-COPY resources/maxime.mp3 /app/server/resources/maxime.mp3
-COPY resources/clara.mp3 /app/server/resources/clara.mp3
-COPY resources/.gitkeep /app/server/resources/.gitkeep
+# Copy voice reference files if they exist
+COPY resources/ /app/server/resources/
 
 WORKDIR /app/server
-
-# Start script for Jobs handler: download models then start handler
-RUN echo '#!/bin/bash\n\
-echo "=== Noctury TTS Jobs Handler Starting ==="\n\
-echo "Device: $(python3 -c '"'"'import torch; print("CUDA" if torch.cuda.is_available() else "CPU")'"'"')"\n\
-\n\
-VOLUME_MODELS="/runpod-volume/models"\n\
-if [ -d "$VOLUME_MODELS/Qwen3-TTS-12Hz-1.7B-VoiceDesign" ]; then\n\
-    echo "Network Volume detected — using pre-loaded models"\n\
-    export NOCTURY_MODEL_VOICEDESIGN="$VOLUME_MODELS/Qwen3-TTS-12Hz-1.7B-VoiceDesign"\n\
-else\n\
-    echo "Downloading VoiceDesign model from HuggingFace..."\n\
-    python3 /app/server/download_models.py\n\
-fi\n\
-\n\
-echo "Starting RunPod Jobs Handler..."\n\
-exec python3 /app/server/handler.py\n\
-' > /app/server/start_jobs.sh && chmod +x /app/server/start_jobs.sh
 
 # Direct entrypoint — no sleep infinity, no FastAPI
 CMD ["/bin/bash", "/app/server/start_jobs.sh"]
